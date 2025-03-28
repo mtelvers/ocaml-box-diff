@@ -33,7 +33,7 @@ module Entries = Map.Make (String)
 let read_from_file filename =
   In_channel.with_open_text filename @@ fun ic -> In_channel.input_all ic
 
-let rec box_get_folder env token_file id =
+let box_get_folder env token_file id =
   let token = read_from_file token_file |> String.trim in
   let client = Client.make ~https:(Some (https ~authenticator)) env#net in
   Eio.Switch.run @@ fun sw ->
@@ -42,28 +42,26 @@ let rec box_get_folder env token_file id =
   let resp, body =
     Client.get ~sw ~headers client
       (Uri.of_string
-         ("https://api.box.com/2.0/folders/" ^ string_of_int id ^ "/items"))
+         ("https://api.box.com/2.0/folders/" ^ string_of_int id ^ "/items?limit=1000"))
   in
   if Http.Status.compare resp.status `OK = 0 then
     let json =
       Eio.Buf_read.(parse_exn take_all) body ~max_size:max_int
       |> Yojson.Safe.from_string
     in
-    Yojson.Safe.Util.member "entries" json
-    |> Yojson.Safe.Util.to_list
-    |> List.filter_map (fun entry ->
-           match field "type" entry with
-           | "file" | "folder" ->
-               let id = field "id" entry |> int_of_string in
-               let name = field "name" entry in
-               Some (name, id)
-           | s ->
-               Printf.printf "Unknown %s\n" s;
-               assert false)
-  else
-    let () = Unix.sleep 60 in
-    let () = Fmt.epr "Unexpected HTTP status: %a" Http.Status.pp resp.status in
-    box_get_folder env token_file id
+    Ok
+      (Yojson.Safe.Util.member "entries" json
+      |> Yojson.Safe.Util.to_list
+      |> List.filter_map (fun entry ->
+             match field "type" entry with
+             | "file" | "folder" ->
+                 let id = field "id" entry |> int_of_string in
+                 let name = field "name" entry in
+                 Some (name, id)
+             | s ->
+                 Printf.printf "Unknown %s\n" s;
+                 assert false))
+  else Error resp.status
 
 let cache = Hashtbl.create 100000
 
@@ -76,9 +74,17 @@ let rec box_check env token_file id = function
         match Hashtbl.find_opt cache id with
         | Some entries -> entries
         | None ->
-            let map = box_get_folder env token_file id |> Entries.of_list in
-            let () = Hashtbl.add cache id map in
-            map
+            let rec loop () =
+              match box_get_folder env token_file id with
+              | Ok lst ->
+                  let map = Entries.of_list lst in
+                  let () = Hashtbl.add cache id map in
+                  map
+              | Error _ ->
+                  let () = Unix.sleep 60 in
+                  loop ()
+            in
+            loop ()
       in
       match Entries.find_opt hd entries with
       | Some id -> box_check env token_file id tl
@@ -98,7 +104,10 @@ let scan env token_file src dst p =
           let d =
             Sys.readdir (src / hd)
             |> Array.to_list
-            |> List.map (Filename.concat hd)
+            |> List.filter_map (fun name ->
+                   match name with
+                   | "Thumbs.db" -> None
+                   | n -> Some (Filename.concat hd n))
           in
           loop (d @ tl)
         else loop tl
