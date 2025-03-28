@@ -1,0 +1,14 @@
+(executable
+ (public_name box)
+ (name main)
+ (libraries
+  cohttp-eio
+  ca-certs
+  tls-eio
+  eio_main
+  mirage-crypto-rng.unix
+  logs.fmt
+  logs.threaded
+  fmt
+  yojson
+  cmdliner))
