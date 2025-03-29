@@ -28,39 +28,46 @@ let https ~authenticator =
 
 let field f j = Yojson.Safe.Util.member f j |> Yojson.Safe.Util.to_string
 
+let field_opt f j =
+  Yojson.Safe.Util.member f j |> Yojson.Safe.Util.to_string_option
+
 module Entries = Map.Make (String)
 
 let read_from_file filename =
   In_channel.with_open_text filename @@ fun ic -> In_channel.input_all ic
 
-let box_get_folder env token_file id =
+let box_list_folder env token_file id marker =
   let token = read_from_file token_file |> String.trim in
   let client = Client.make ~https:(Some (https ~authenticator)) env#net in
   Eio.Switch.run @@ fun sw ->
   let headers = Http.Header.init () in
   let headers = Http.Header.add headers "authorization" ("Bearer " ^ token) in
-  let resp, body =
-    Client.get ~sw ~headers client
-      (Uri.of_string
-         ("https://api.box.com/2.0/folders/" ^ string_of_int id ^ "/items?limit=1000"))
+  let uri =
+    "https://api.box.com/2.0/folders/" ^ string_of_int id
+    ^ "/items?usemarker=true&limit=1000"
   in
+  let uri = match marker with Some m -> uri ^ "&marker=" ^ m | None -> uri in
+  let resp, body = Client.get ~sw ~headers client (Uri.of_string uri) in
   if Http.Status.compare resp.status `OK = 0 then
     let json =
       Eio.Buf_read.(parse_exn take_all) body ~max_size:max_int
       |> Yojson.Safe.from_string
     in
+    let next_marker = field_opt "next_marker" json in
     Ok
-      (Yojson.Safe.Util.member "entries" json
-      |> Yojson.Safe.Util.to_list
-      |> List.filter_map (fun entry ->
-             match field "type" entry with
-             | "file" | "folder" ->
-                 let id = field "id" entry |> int_of_string in
-                 let name = field "name" entry in
-                 Some (name, id)
-             | s ->
-                 Printf.printf "Unknown %s\n" s;
-                 assert false))
+      ( Yojson.Safe.Util.member "entries" json
+        |> Yojson.Safe.Util.to_list
+        |> List.filter_map (fun entry ->
+               match field "type" entry with
+               | "file" | "folder" ->
+                   let id = field "id" entry |> int_of_string in
+                   let name = field "name" entry in
+                   Some (name, id)
+               | s ->
+                   Printf.printf "Unknown %s\n" s;
+                   assert false)
+        |> Entries.of_list,
+        next_marker )
   else Error resp.status
 
 let cache = Hashtbl.create 100000
@@ -74,17 +81,21 @@ let rec box_check env token_file id = function
         match Hashtbl.find_opt cache id with
         | Some entries -> entries
         | None ->
-            let rec loop () =
-              match box_get_folder env token_file id with
-              | Ok lst ->
-                  let map = Entries.of_list lst in
-                  let () = Hashtbl.add cache id map in
-                  map
+            let rec loop marker =
+              match box_list_folder env token_file id marker with
+              | Ok (map, next_marker) -> (
+                  match next_marker with
+                  | Some _ ->
+                      Entries.union (fun _ _ a -> Some a) map (loop next_marker)
+                  | None -> map)
               | Error _ ->
+                  let () = Printf.printf "sleeping\n%!" in
                   let () = Unix.sleep 60 in
-                  loop ()
+                  loop marker
             in
-            loop ()
+            let map = loop None in
+            let () = Hashtbl.add cache id map in
+            map
       in
       match Entries.find_opt hd entries with
       | Some id -> box_check env token_file id tl
@@ -107,6 +118,9 @@ let scan env token_file src dst p =
             |> List.filter_map (fun name ->
                    match name with
                    | "Thumbs.db" -> None
+                   | s when String.starts_with ~prefix:"~$" s -> None
+                   | s when String.ends_with ~suffix:".tmp" s -> None
+                   | s when String.ends_with ~suffix:".TMP" s -> None
                    | n -> Some (Filename.concat hd n))
           in
           loop (d @ tl)
@@ -121,9 +135,9 @@ let scan env token_file src dst p =
   in
   loop [ p ]
 
-let call env token_file _ =
+let call env token_file src dst fldr =
   Mirage_crypto_rng_unix.use_default ();
-  let _ = scan env token_file "/data2/Assets" "Data/Assets" "Dunlin" in
+  let _ = scan env token_file src dst fldr in
   ()
 
 open Cmdliner
@@ -133,14 +147,27 @@ let token_file =
   @@ Arg.opt Arg.(some string) None
   @@ Arg.info [ "token-file" ] ~docv:"TOKEN" ~doc:"API token"
 
-let id =
+let src_dir =
   Arg.required
   @@ Arg.opt Arg.(some string) None
-  @@ Arg.info [ "id" ] ~docv:"ID" ~doc:"Station code to query"
+  @@ Arg.info [ "src-dir" ] ~docv:"SRC_DIR" ~doc:"Source Directory"
+
+let dest_dir =
+  Arg.required
+  @@ Arg.opt Arg.(some string) None
+  @@ Arg.info [ "dest-dir" ] ~docv:"DEST_DIR" ~doc:"Destination Directory"
+
+let dir =
+  Arg.required
+  @@ Arg.opt Arg.(some string) None
+  @@ Arg.info [ "dir" ] ~docv:"DIR"
+       ~doc:"Directory to compare in SRC_DIR with the one in DEST_DIR"
 
 let prog env =
-  let doc = "Mirror Box API" in
-  let info = Cmd.info "query" ~doc in
-  Cmd.v info Term.(const (call env) $ token_file $ id)
+  let doc =
+    "Compare a local DIR in SRC_DIR with DEST_DIR on Box using the Box API"
+  in
+  let info = Cmd.info "box" ~doc in
+  Cmd.v info Term.(const (call env) $ token_file $ src_dir $ dest_dir $ dir)
 
 let _ = Eio_main.run @@ fun env -> Cmd.eval (prog env)
