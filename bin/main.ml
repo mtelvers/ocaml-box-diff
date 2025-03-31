@@ -26,11 +26,6 @@ let https ~authenticator =
     in
     Tls_eio.client_of_flow ?host tls_config raw
 
-let field f j = Yojson.Safe.Util.member f j |> Yojson.Safe.Util.to_string
-
-let field_opt f j =
-  Yojson.Safe.Util.member f j |> Yojson.Safe.Util.to_string_option
-
 module Entries = Map.Make (String)
 
 let read_from_file filename =
@@ -53,18 +48,27 @@ let box_list_folder env token_file id marker =
       Eio.Buf_read.(parse_exn take_all) body ~max_size:max_int
       |> Yojson.Safe.from_string
     in
-    let next_marker = field_opt "next_marker" json in
+    let next_marker =
+      Yojson.Safe.Util.member "next_marker" json
+      |> Yojson.Safe.Util.to_string_option
+    in
     Ok
       ( Yojson.Safe.Util.member "entries" json
         |> Yojson.Safe.Util.to_list
         |> List.filter_map (fun entry ->
-               match field "type" entry with
-               | "file" | "folder" ->
-                   let id = field "id" entry |> int_of_string in
-                   let name = field "name" entry in
+               match Yojson.Safe.Util.member "type" entry with
+               | `String "file" | `String "folder" ->
+                   let id =
+                     Yojson.Safe.Util.member "id" entry
+                     |> Yojson.Safe.Util.to_string |> int_of_string
+                   in
+                   let name =
+                     Yojson.Safe.Util.member "name" entry
+                     |> Yojson.Safe.Util.to_string
+                   in
                    Some (name, id)
-               | s ->
-                   Printf.printf "Unknown %s\n" s;
+               | _ ->
+                   Printf.printf "Unknown entry\n";
                    assert false)
         |> Entries.of_list,
         next_marker )
@@ -118,6 +122,7 @@ let scan env token_file src dst p =
             |> List.filter_map (fun name ->
                    match name with
                    | "Thumbs.db" -> None
+                   | s when String.starts_with ~prefix:"." s -> None
                    | s when String.starts_with ~prefix:"~$" s -> None
                    | s when String.ends_with ~suffix:".tmp" s -> None
                    | s when String.ends_with ~suffix:".TMP" s -> None
