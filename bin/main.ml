@@ -53,16 +53,19 @@ let stream_of_string x =
   in
   go
 
-let stream_of_file ~sw env filename =
+let stream_of_file ~sw env filename ctx =
   let ( / ) = Eio.Path.( / ) in
   let path = Eio.Stdenv.cwd env / filename in
   let buffer = Cstruct.create 4096 in
   let flow = Eio.Path.open_in ~sw path in
   let go () =
     match Eio.Flow.single_read flow buffer with
-    | 0 -> None
+    | 0 ->
+        Eio.Flow.close flow;
+        None
     | n ->
         let chunk = Cstruct.to_string (Cstruct.sub buffer 0 n) in
+        let () = Sha1.update_string ctx chunk in
         Some (chunk, 0, n)
     | exception End_of_file -> None
   in
@@ -82,15 +85,8 @@ let string_of_stream s =
 let box_upload_file env token_file id filename =
   let open Multipart_form in
   let token = read_from_file token_file |> String.trim in
-  (* let client = Client.make ~https:None env#net in *)
   let client = Client.make ~https:(Some (https ~authenticator)) env#net in
   Eio.Switch.run @@ fun sw ->
-  (*
-  let body = Eio.Stream.create max_int in
-  Eio.Stream.add body (
-  let q = stream ~sw ~identify:(fun v _ -> v) body in
-  let header, stream = to_stream t in
-    *)
   let json_string =
     Yojson.Safe.to_string
       (`Assoc
@@ -108,13 +104,13 @@ let box_upload_file env token_file id filename =
     Content_type.make `Application (`Iana_token "octet-stream")
       Content_type.Parameters.empty
   in
+  let ctx = Sha1.init () in
   let p1 =
     part
       ~disposition:(Content_disposition.v ~filename "file")
       ~header:
         (Header.of_list [ Field (Field_name.content_type, Content_type, v) ])
-      (stream_of_file ~sw env filename)
-    (* stream_of_string "bar" *)
+      (stream_of_file ~sw env filename ctx)
   in
   let t = multipart ~rng:(fun ?g:_ len -> random_string len) [ p0; p1 ] in
   let formheader, stream = to_stream t in
@@ -125,14 +121,31 @@ let box_upload_file env token_file id filename =
       (Header.content_type formheader |> Content_type.to_string)
   in
   let uri = "https://upload.box.com/api/2.0/files/content" in
-  (*let uri = "http://127.0.0.1:6789" in *)
   let resp, body =
     Client.post
       ~body:(Body.of_string (string_of_stream stream))
       ~sw ~headers client (Uri.of_string uri)
   in
+  let sha1 = Sha1.finalize ctx |> Sha1.to_hex in
   if Http.Status.compare resp.status `Created = 0 then
     let reply = Eio.Buf_read.(parse_exn take_all) body ~max_size:max_int in
+    let () = Eio.traceln "%s" sha1 in
+    let entries =
+      Yojson.Safe.from_string reply
+      |> Yojson.Safe.Util.member "entries"
+      |> Yojson.Safe.Util.to_list
+    in
+    let _ =
+      List.map
+        (fun entry ->
+          let box_sha1 =
+            Yojson.Safe.Util.member "file_version" entry
+            |> Yojson.Safe.Util.member "sha1"
+            |> Yojson.Safe.Util.to_string
+          in
+          assert (sha1 = box_sha1))
+        entries
+    in
     Ok (Printf.printf "%s\n%!" reply)
   else (
     Fmt.epr "Unexpected HTTP status: %a" Http.Status.pp resp.status;
