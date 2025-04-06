@@ -53,6 +53,21 @@ let stream_of_string x =
   in
   go
 
+let stream_of_file ~sw env filename =
+  let ( / ) = Eio.Path.( / ) in
+  let path = Eio.Stdenv.cwd env / filename in
+  let buffer = Cstruct.create 4096 in
+  let flow = Eio.Path.open_in ~sw path in
+  let go () =
+    match Eio.Flow.single_read flow buffer with
+    | 0 -> None
+    | n ->
+        let chunk = Cstruct.to_string (Cstruct.sub buffer 0 n) in
+        Some (chunk, 0, n)
+    | exception End_of_file -> None
+  in
+  go
+
 let string_of_stream s =
   let buf = Buffer.create 0x100 in
   let rec go () =
@@ -98,7 +113,8 @@ let box_upload_file env token_file id filename =
       ~disposition:(Content_disposition.v ~filename "file")
       ~header:
         (Header.of_list [ Field (Field_name.content_type, Content_type, v) ])
-      (stream_of_string "bar")
+      (stream_of_file ~sw env filename)
+    (* stream_of_string "bar" *)
   in
   let t = multipart ~rng:(fun ?g:_ len -> random_string len) [ p0; p1 ] in
   let formheader, stream = to_stream t in
@@ -233,7 +249,7 @@ let scan env token_file src dst p =
 
 let call env token_file src dst fldr =
   Mirage_crypto_rng_unix.use_default ();
-  let _ = box_upload_file env token_file 0 "foo.txt" in
+  let _ = box_upload_file env token_file 0 "stakeholder.pdf" in
   (* let _ = scan env token_file src dst fldr in *)
   ()
 
