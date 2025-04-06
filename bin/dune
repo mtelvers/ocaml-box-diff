@@ -7,6 +7,7 @@
   tls-eio
   eio_main
   mirage-crypto-rng.unix
+  multipart_form-eio
   logs.fmt
   logs.threaded
   fmt

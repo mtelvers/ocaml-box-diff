@@ -11,7 +11,8 @@ let authenticator =
 let () =
   Logs.set_reporter (Logs_fmt.reporter ());
   Logs_threaded.enable ();
-  Logs.Src.set_level Cohttp_eio.src None (* (Some Debug) *)
+  Logs.Src.set_level Cohttp_eio.src (Some Debug)
+(* (Some Debug) *)
 
 let https ~authenticator =
   let tls_config =
@@ -30,6 +31,96 @@ module Entries = Map.Make (String)
 
 let read_from_file filename =
   In_channel.with_open_text filename @@ fun ic -> In_channel.input_all ic
+
+let random_string len =
+  let res = Bytes.create len in
+  for i = 0 to len - 1 do
+    let code = Random.int (10 + 26 + 26) in
+    if code < 10 then Bytes.set res i (Char.chr (Char.code '0' + code))
+    else if code < 10 + 16 then
+      Bytes.set res i (Char.chr (Char.code 'a' + code - 10))
+    else Bytes.set res i (Char.chr (Char.code 'A' + code - (10 + 26)))
+  done;
+  Bytes.unsafe_to_string res
+
+let stream_of_string x =
+  let once = ref false in
+  let go () =
+    if !once then None
+    else (
+      once := true;
+      Some (x, 0, String.length x))
+  in
+  go
+
+let string_of_stream s =
+  let buf = Buffer.create 0x100 in
+  let rec go () =
+    match s () with
+    | None -> Buffer.contents buf
+    | Some (str, off, len) ->
+        Buffer.add_substring buf str off len;
+        go ()
+  in
+  go ()
+
+let box_upload_file env token_file id filename =
+  let open Multipart_form in
+  let token = read_from_file token_file |> String.trim in
+  (* let client = Client.make ~https:None env#net in *)
+  let client = Client.make ~https:(Some (https ~authenticator)) env#net in
+  Eio.Switch.run @@ fun sw ->
+  (*
+  let body = Eio.Stream.create max_int in
+  Eio.Stream.add body (
+  let q = stream ~sw ~identify:(fun v _ -> v) body in
+  let header, stream = to_stream t in
+    *)
+  let json_string =
+    Yojson.Safe.to_string
+      (`Assoc
+         [
+           ("name", `String filename);
+           ("parent", `Assoc [ ("id", `String (string_of_int id)) ]);
+         ])
+  in
+  let p0 =
+    part
+      ~disposition:(Content_disposition.v "attributes")
+      (stream_of_string json_string)
+  in
+  let v =
+    Content_type.make `Application (`Iana_token "octet-stream")
+      Content_type.Parameters.empty
+  in
+  let p1 =
+    part
+      ~disposition:(Content_disposition.v ~filename "file")
+      ~header:
+        (Header.of_list [ Field (Field_name.content_type, Content_type, v) ])
+      (stream_of_string "bar")
+  in
+  let t = multipart ~rng:(fun ?g:_ len -> random_string len) [ p0; p1 ] in
+  let formheader, stream = to_stream t in
+  let headers = Http.Header.init () in
+  let headers = Http.Header.add headers "authorization" ("Bearer " ^ token) in
+  let headers =
+    Http.Header.add headers "content-type"
+      (Header.content_type formheader |> Content_type.to_string)
+  in
+  let uri = "https://upload.box.com/api/2.0/files/content" in
+  (*let uri = "http://127.0.0.1:6789" in *)
+  let resp, body =
+    Client.post
+      ~body:(Body.of_string (string_of_stream stream))
+      ~sw ~headers client (Uri.of_string uri)
+  in
+  if Http.Status.compare resp.status `Created = 0 then
+    let reply = Eio.Buf_read.(parse_exn take_all) body ~max_size:max_int in
+    Ok (Printf.printf "%s\n%!" reply)
+  else (
+    Fmt.epr "Unexpected HTTP status: %a" Http.Status.pp resp.status;
+    Error resp.status)
 
 let box_list_folder env token_file id marker =
   let token = read_from_file token_file |> String.trim in
@@ -142,7 +233,8 @@ let scan env token_file src dst p =
 
 let call env token_file src dst fldr =
   Mirage_crypto_rng_unix.use_default ();
-  let _ = scan env token_file src dst fldr in
+  let _ = box_upload_file env token_file 0 "foo.txt" in
+  (* let _ = scan env token_file src dst fldr in *)
   ()
 
 open Cmdliner
