@@ -151,6 +151,47 @@ let box_upload_file env token_file id filename =
     Fmt.epr "Unexpected HTTP status: %a" Http.Status.pp resp.status;
     Error resp.status)
 
+let box_create_upload_session env token_file id filename =
+  let token = read_from_file token_file |> String.trim in
+  let client = Client.make ~https:(Some (https ~authenticator)) env#net in
+  Eio.Switch.run @@ fun sw ->
+  let json_string =
+    Yojson.Safe.to_string
+      (`Assoc
+         [
+           ("folder_id", `String (string_of_int id));
+           ("file_size", `Int 60_000_000);
+           ("file_name", `String filename);
+         ])
+  in
+  let headers = Http.Header.init () in
+  let headers = Http.Header.add headers "authorization" ("Bearer " ^ token) in
+  let headers = Http.Header.add headers "content-type" "application/json" in
+  let uri = "https://upload.box.com/api/2.0/files/upload_sessions" in
+  let resp, body =
+    Client.post
+      ~body:(Body.of_string json_string)
+      ~sw ~headers client (Uri.of_string uri)
+  in
+  if Http.Status.compare resp.status `Created = 0 then
+    let reply = Eio.Buf_read.(parse_exn take_all) body ~max_size:max_int in
+    let reply = Yojson.Safe.from_string reply in
+    let part_size =
+      Yojson.Safe.Util.member "part_size" reply |> Yojson.Safe.Util.to_int
+    in
+    let endpoints = Yojson.Safe.Util.member "session_endpoints" reply in
+    let upload_part =
+      Yojson.Safe.Util.member "upload_part" endpoints
+      |> Yojson.Safe.Util.to_string
+    in
+    let commit =
+      Yojson.Safe.Util.member "commit" endpoints |> Yojson.Safe.Util.to_string
+    in
+    Ok (Printf.printf "%i\n%s\n%s\n%!" part_size upload_part commit)
+  else (
+    Fmt.epr "Unexpected HTTP status: %a" Http.Status.pp resp.status;
+    Error resp.status)
+
 let box_list_folder env token_file id marker =
   let token = read_from_file token_file |> String.trim in
   let client = Client.make ~https:(Some (https ~authenticator)) env#net in
@@ -262,7 +303,8 @@ let scan env token_file src dst p =
 
 let call env token_file src dst fldr =
   Mirage_crypto_rng_unix.use_default ();
-  let _ = box_upload_file env token_file 0 "stakeholder.pdf" in
+  (* let _ = box_upload_file env token_file 0 "stakeholder.pdf" in *)
+  let _ = box_create_upload_session env token_file 0 "stakeholder.pdf" in
   (* let _ = scan env token_file src dst fldr in *)
   ()
 
